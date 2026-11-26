@@ -1,18 +1,21 @@
-"""A thin, tool-shaped wrapper around one GDB process driven through MI.
+"""Tool-shaped wrappers around GDB processes driven through MI.
 
-pygdbmi speaks GDB/MI over a pipe; this module turns that into a small set of
-operations an MCP client can call: start, load, breakpoints, run/continue/step,
-and inspection (stack, variables, registers, memory, expressions).
+pygdbmi speaks GDB/MI over a pipe; this module turns that into the operations an
+MCP client needs: start a session (launch a program, attach to a PID, or open a
+core file), set breakpoints, run/continue/step, and inspect stack, variables,
+registers and memory.
 
 Design rules:
-  * One session per server process. GDB is stateful and an MCP client expects
-    its session to survive between tool calls.
+  * GDB is stateful, so a session survives between tool calls. Several sessions
+    can live side by side, each keyed by a ``session_id``, so two targets can be
+    debugged at once without one's breakpoints landing in the other.
   * Every call returns plain JSON-able data with the interesting fields pulled
-    out of the MI records. Raw MI is available through ``command()`` for
-    anything this wrapper does not model, so nothing is out of reach.
+    out of the MI records. Raw MI stays reachable through ``command()``.
   * Execution control waits for the resulting stop event instead of returning as
-    soon as the command is accepted, because "run" only answers ``^running``
-    while the useful answer is the ``*stopped`` that follows.
+    soon as the command is accepted: "run" only answers ``^running``, while the
+    useful answer is the ``*stopped`` that follows.
+  * The user's ``~/.gdbinit`` is loaded by default (set ``load_init=False`` to
+    skip it), so GEF, pwndbg and hand-written helpers keep working.
 """
 
 from __future__ import annotations
@@ -25,6 +28,20 @@ from typing import Any
 from pygdbmi.gdbcontroller import GdbController
 
 DEFAULT_TIMEOUT = 10.0
+
+# Stop reasons as GDB spells them, mapped to the words a client should branch on.
+_REASONS = {
+    "breakpoint-hit": "breakpoint",
+    "exited-normally": "exited",
+    "exited-signalled": "exited",
+    "signal-received": "signal",
+    "end-stepping-range": "step",
+    "function-finished": "finished",
+    "location-reached": "location",
+    "watchpoint-trigger": "watchpoint",
+    "read-watchpoint-trigger": "watchpoint",
+    "access-watchpoint-trigger": "watchpoint",
+}
 
 
 class GdbError(RuntimeError):
@@ -61,18 +78,6 @@ class Stop:
         return data
 
 
-_REASONS = {
-    "breakpoint-hit": "breakpoint",
-    "exited-normally": "exited",
-    "exited-signalled": "exited",
-    "signal-received": "signal",
-    "end-stepping-range": "step",
-    "function-finished": "finished",
-    "location-reached": "location",
-    "watchpoint-trigger": "watchpoint",
-}
-
-
 def _frame_from_payload(payload: dict[str, Any]) -> Stop:
     frame = payload.get("frame") or {}
     line = frame.get("line")
@@ -90,12 +95,16 @@ def _frame_from_payload(payload: dict[str, Any]) -> Stop:
 
 
 class GdbSession:
-    """Owns exactly one GDB subprocess."""
+    """One GDB subprocess, addressed by its own ``session_id``."""
 
-    def __init__(self) -> None:
+    def __init__(self, session_id: str, load_init: bool = True) -> None:
+        self.session_id = session_id
+        self.load_init = load_init
         self._lock = threading.Lock()
         self._ctrl: GdbController | None = None
         self._program: str | None = None
+        self._pid: int | None = None
+        self._core: str | None = None
         self._breakpoints: dict[str, str] = {}
         self.last_stop: Stop | None = None
         self.running = False
@@ -106,31 +115,61 @@ class GdbSession:
     def active(self) -> bool:
         return self._ctrl is not None
 
+    @property
+    def kind(self) -> str:
+        if self._core:
+            return "core"
+        if self._pid is not None:
+            return "attached"
+        return "launched"
+
     def start(self, program: str | None = None, args: list[str] | None = None, gdb_path: str = "gdb") -> dict[str, Any]:
         with self._lock:
-            if self._ctrl is not None:
-                if program:
-                    self._load_locked(program)
-                return self.status_locked()
-            resolved = shutil.which(gdb_path) or gdb_path
-            # pygdbmi takes the whole command line, not a path plus args.
-            self._ctrl = GdbController(
-                command=[resolved, "--interpreter=mi3", "-q", "-nx"],
-            )
-            # Quiet the startup chatter (the MI banner) so the first tool call
-            # does not return a wall of log records.
-            self._drain_locked(0.6)
-            self._send_locked("-enable-pretty-printing", timeout=2.0)
+            if self._ctrl is None:
+                self._spawn_locked(gdb_path)
             if args:
-                self._send_locked("-exec-arguments " + " ".join(args), timeout=2.0)
+                self._send_locked("-exec-arguments " + " ".join(_quote(a) for a in args), timeout=2.0)
             if program:
                 self._load_locked(program)
+            return self.status_locked()
+
+    def attach(self, pid: int, gdb_path: str = "gdb") -> dict[str, Any]:
+        """Attach to a running process. It keeps running after gdb_detach."""
+        with self._lock:
+            if self._ctrl is None:
+                self._spawn_locked(gdb_path)
+            self._core = None
+            self._send_locked(f"-target-attach {int(pid)}", timeout=10.0)
+            self._drain_locked(0.3)
+            self._pid = int(pid)
+            return self.status_locked()
+
+    def load_core(self, core_path: str, program: str | None = None, gdb_path: str = "gdb") -> dict[str, Any]:
+        """Open a core file, optionally with the executable that produced it."""
+        with self._lock:
+            if self._ctrl is None:
+                self._spawn_locked(gdb_path)
+            if program:
+                self._load_locked(program)
+            self._send_locked(f'-interpreter-exec console {_quote(f"core-file {core_path}")}', timeout=30.0)
+            self._drain_locked(0.3)
+            self._core = core_path
+            self._pid = None
+            return self.status_locked()
+
+    def detach(self) -> dict[str, Any]:
+        with self._lock:
+            self._require_locked()
+            if self._pid is None:
+                raise GdbError("this session is not attached to a process")
+            self._send_locked("-target-detach", timeout=10.0)
+            self._pid = None
             return self.status_locked()
 
     def stop(self) -> dict[str, Any]:
         with self._lock:
             if self._ctrl is None:
-                return {"active": False}
+                return {"active": False, "session_id": self.session_id}
             try:
                 self._send_locked("-gdb-exit", timeout=2.0)
             except GdbError:
@@ -141,33 +180,53 @@ class GdbSession:
                 pass
             self._ctrl = None
             self._program = None
+            self._pid = None
+            self._core = None
             self._breakpoints.clear()
             self.last_stop = None
             self.running = False
-            return {"active": False}
+            return {"active": False, "session_id": self.session_id}
+
+    def _spawn_locked(self, gdb_path: str) -> None:
+        resolved = shutil.which(gdb_path) or gdb_path
+        command = [resolved]
+        if not self.load_init:
+            # -nx is what suppresses ~/.gdbinit (and the system gdbinit).
+            command.append("-nx")
+        command += ["--interpreter=mi3", "-q"]
+        self._ctrl = GdbController(command=command)
+        self._drain_locked(0.6)
+        self._send_locked("-enable-pretty-printing", timeout=2.0)
+        # Breakpoints set before the library is loaded should still fire, and a
+        # long-running program should stop on a signal rather than vanishing.
+        self._send_locked("-gdb-set breakpoint pending on", timeout=2.0)
 
     def _load_locked(self, program: str) -> None:
         self._require_locked()
         self._send_locked(f"-file-exec-and-symbols {_quote(program)}", timeout=30.0)
         self._program = program
+        self._core = None
 
     # ------------------------------------------------------------------ plumbing
 
     def _require_locked(self) -> None:
         if self._ctrl is None:
-            raise GdbError("GDB is not running. Call gdb_start first.")
+            raise GdbError(
+                f"session {self.session_id} has no GDB process yet. "
+                "Call gdb_start, gdb_attach or gdb_load_core first."
+            )
 
     def _send_locked(self, command: str, timeout: float = DEFAULT_TIMEOUT) -> list[dict[str, Any]]:
         self._require_locked()
         assert self._ctrl is not None
-        responses = self._ctrl.write(command, timeout_sec=min(timeout, 30.0))
+        responses = self._ctrl.write(command, timeout_sec=min(timeout, 60.0))
         # Raw, not compacted: callers read payload["stack"], ["variables"],
-        # ["memory"] and ["BreakpointTable"], which _compact would strip.
+        # ["memory"] and ["BreakpointTable"].
         records = [r for r in responses if isinstance(r, dict)]
         self._absorb_locked(responses)
         for record in records:
             if record.get("type") == "result" and record.get("message") == "error":
-                raise GdbError(record.get("error") or f"GDB rejected {command!r}")
+                raise GdbError(_error_text(record) or f"GDB rejected {command!r}")
         return records
 
     def _drain_locked(self, wait: float) -> list[dict[str, Any]]:
@@ -175,10 +234,10 @@ class GdbSession:
         assert self._ctrl is not None
         raw = self._ctrl.get_gdb_response(timeout_sec=wait, raise_error_on_timeout=False)
         self._absorb_locked(raw)
-        return [_compact(r) for r in raw if isinstance(r, dict)]
+        return [r for r in raw if isinstance(r, dict)]
 
     def _absorb_locked(self, responses: list[dict[str, Any]]) -> None:
-        """Track running/stopped state from async records."""
+        """Track running/stopped state and breakpoint ids from async records."""
         for record in responses:
             if not isinstance(record, dict):
                 continue
@@ -278,6 +337,7 @@ class GdbSession:
                 "number": str(bkpt.get("number", "")),
                 "location": _describe_location(bkpt),
                 "address": str(bkpt.get("addr", "")),
+                "pending": str(bkpt.get("pending", "")) or None,
             }
 
     def delete_breakpoint(self, number: str) -> dict[str, Any]:
@@ -292,24 +352,23 @@ class GdbSession:
             return self._breakpoints_locked()
 
     def _breakpoints_locked(self) -> list[dict[str, Any]]:
-        if True:
-            self._require_locked()
-            records = self._send_locked("-break-list", timeout=5.0)
-            out: list[dict[str, Any]] = []
-            for record in records:
-                payload = record.get("payload") or {}
-                table = payload.get("BreakpointTable") or {}
-                for item in table.get("body") or []:
-                    # Same shape question as the stack: flat in MI3, nested in MI2.
-                    bkpt = (item.get("bkpt", item)) if isinstance(item, dict) else {}
-                    if bkpt:
-                        out.append({
-                            "number": str(bkpt.get("number", "")),
-                            "location": _describe_location(bkpt),
-                            "address": str(bkpt.get("addr", "")),
-                            "enabled": str(bkpt.get("enabled", "y")),
-                        })
-            return out
+        self._require_locked()
+        records = self._send_locked("-break-list", timeout=5.0)
+        out: list[dict[str, Any]] = []
+        for record in records:
+            payload = record.get("payload") or {}
+            table = payload.get("BreakpointTable") or {}
+            for item in table.get("body") or []:
+                # Flat rows in MI3; MI2 nests them under "bkpt".
+                bkpt = (item.get("bkpt", item)) if isinstance(item, dict) else {}
+                if bkpt:
+                    out.append({
+                        "number": str(bkpt.get("number", "")),
+                        "location": _describe_location(bkpt),
+                        "address": str(bkpt.get("addr", "")),
+                        "enabled": str(bkpt.get("enabled", "y")),
+                    })
+        return out
 
     # --------------------------------------------------------------- inspection
 
@@ -318,51 +377,44 @@ class GdbSession:
             return self._stack_locked(limit)
 
     def _stack_locked(self, limit: int = 20) -> list[dict[str, Any]]:
-        if True:
-            self._require_locked()
-            records = self._send_locked(f"-stack-list-frames 0 {max(0, limit - 1)}", timeout=5.0)
-            frames: list[dict[str, Any]] = []
-            for record in records:
-                payload = record.get("payload") or {}
-                for entry in payload.get("stack") or []:
-                    # MI3 returns flat frames here; MI2 nesting (entry["frame"])
-                    # still works through the fallback.
-                    frame = entry.get("frame", entry) if isinstance(entry, dict) else {}
-                    level = frame.get("level")
-                    frames.append({
-                        "level": int(level) if isinstance(level, (int, str)) and str(level).isdigit() else level,
-                        "function": frame.get("func", ""),
-                        "file": frame.get("file", ""),
-                        "line": frame.get("line", ""),
-                        "address": frame.get("addr", ""),
-                    })
-            return frames
+        self._require_locked()
+        records = self._send_locked(f"-stack-list-frames 0 {max(0, limit - 1)}", timeout=5.0)
+        frames: list[dict[str, Any]] = []
+        for record in records:
+            payload = record.get("payload") or {}
+            for entry in payload.get("stack") or []:
+                frame = entry.get("frame", entry) if isinstance(entry, dict) else {}
+                level = frame.get("level")
+                frames.append({
+                    "level": int(level) if isinstance(level, (int, str)) and str(level).isdigit() else level,
+                    "function": frame.get("func", ""),
+                    "file": frame.get("file", ""),
+                    "line": frame.get("line", ""),
+                    "address": frame.get("addr", ""),
+                })
+        return frames
 
     def variables(self, frame: int | None = None) -> list[dict[str, Any]]:
         with self._lock:
             return self._variables_locked(frame)
 
     def _variables_locked(self, frame: int | None = None) -> list[dict[str, Any]]:
-        if True:
-            self._require_locked()
-            command = "-stack-list-variables --simple-values"
-            if frame is not None:
-                command = f"-stack-select-frame {frame}"
-                self._send_locked(command, timeout=5.0)
-                command = "-stack-list-variables --simple-values"
-            records = self._send_locked(command, timeout=5.0)
-            out: list[dict[str, Any]] = []
-            for record in records:
-                payload = record.get("payload") or {}
-                for variable in payload.get("variables") or []:
-                    if not isinstance(variable, dict):
-                        continue
-                    out.append({
-                        "name": variable.get("name", ""),
-                        "value": variable.get("value", ""),
-                        "type": variable.get("type", ""),
-                    })
-            return out
+        self._require_locked()
+        if frame is not None:
+            self._send_locked(f"-stack-select-frame {frame}", timeout=5.0)
+        records = self._send_locked("-stack-list-variables --simple-values", timeout=5.0)
+        out: list[dict[str, Any]] = []
+        for record in records:
+            payload = record.get("payload") or {}
+            for variable in payload.get("variables") or []:
+                if not isinstance(variable, dict):
+                    continue
+                out.append({
+                    "name": variable.get("name", ""),
+                    "value": variable.get("value", ""),
+                    "type": variable.get("type", ""),
+                })
+        return out
 
     def evaluate(self, expression: str) -> dict[str, Any]:
         with self._lock:
@@ -426,27 +478,29 @@ class GdbSession:
 
     def status(self) -> dict[str, Any]:
         with self._lock:
-            if self._ctrl is None:
-                return {"active": False, "program": None, "running": False, "breakpoints": []}
             return self.status_locked()
 
     def status_locked(self) -> dict[str, Any]:
-        return {
-            "active": True,
+        base: dict[str, Any] = {
+            "session_id": self.session_id,
+            "active": self._ctrl is not None,
+            "kind": self.kind if self._ctrl else None,
+            "load_init": self.load_init,
             "program": self._program,
+            "pid": self._pid,
+            "core": self._core,
             "running": self.running,
             "breakpoints": sorted(self._breakpoints, key=lambda n: int(n) if n.isdigit() else 0),
             "last_stop": self.last_stop.as_dict() if self.last_stop else None,
         }
+        return base
 
     def _stopped_state_locked(self) -> dict[str, Any]:
         state = self.status_locked()
         if self.last_stop is None:
-            state["last_stop"] = None
             state["note"] = "no stop event within the timeout (still running, or exited)"
             return state
-        # These run while the caller already holds the lock: calling the public
-        # wrappers here deadlocked the whole server on the first gdb_run.
+        # Lock-free internals: the caller already holds the lock.
         try:
             state["variables"] = self._variables_locked()
         except GdbError:
@@ -458,9 +512,95 @@ class GdbSession:
         return state
 
 
+class SessionManager:
+    """Owns every live GDB session, addressed by ``session_id``."""
+
+    def __init__(self) -> None:
+        self._sessions: dict[str, GdbSession] = {}
+        self._lock = threading.Lock()
+        self._counter = 0
+
+    def create(self, program: str | None = None, args: list[str] | None = None,
+               load_init: bool = True, gdb_path: str = "gdb") -> GdbSession:
+        with self._lock:
+            self._counter += 1
+            session = GdbSession(session_id=str(self._counter), load_init=load_init)
+            self._sessions[session.session_id] = session
+        session.start(program=program, args=args, gdb_path=gdb_path)
+        return session
+
+    def attach(self, pid: int, load_init: bool = True, gdb_path: str = "gdb") -> GdbSession:
+        with self._lock:
+            self._counter += 1
+            session = GdbSession(session_id=str(self._counter), load_init=load_init)
+            self._sessions[session.session_id] = session
+        session.attach(pid, gdb_path=gdb_path)
+        return session
+
+    def load_core(self, core_path: str, program: str | None = None,
+                  load_init: bool = True, gdb_path: str = "gdb") -> GdbSession:
+        with self._lock:
+            self._counter += 1
+            session = GdbSession(session_id=str(self._counter), load_init=load_init)
+            self._sessions[session.session_id] = session
+        session.load_core(core_path, program=program, gdb_path=gdb_path)
+        return session
+
+    def resolve(self, session_id: str | None) -> GdbSession:
+        """Find a session, defaulting to the only one when the id is omitted."""
+        with self._lock:
+            live = {sid: s for sid, s in self._sessions.items() if s.active}
+            if session_id is None:
+                if len(live) == 1:
+                    return next(iter(live.values()))
+                if not live:
+                    raise GdbError("no session is open. Call gdb_start, gdb_attach or gdb_load_core first.")
+                raise GdbError(
+                    "several sessions are open, so session_id is required: "
+                    + ", ".join(sorted(live, key=int))
+                )
+            session = self._sessions.get(str(session_id))
+            if session is None:
+                raise GdbError(f"unknown session_id {session_id!r}; open sessions: {sorted(live) or 'none'}")
+            if not session.active:
+                raise GdbError(f"session {session_id} has been closed")
+            return session
+
+    def close(self, session_id: str | None = None) -> dict[str, Any]:
+        if session_id is None:
+            with self._lock:
+                live = [s for s in self._sessions.values() if s.active]
+            if len(live) != 1:
+                raise GdbError(
+                    "session_id is required when several sessions are open: "
+                    + ", ".join(sorted(s.session_id for s in live)) if live else "no session is open"
+                )
+            session_id = live[0].session_id
+        with self._lock:
+            session = self._sessions.pop(str(session_id), None)
+        if session is None:
+            raise GdbError(f"unknown session_id {session_id!r}")
+        return session.stop()
+
+    def list(self) -> list[dict[str, Any]]:
+        with self._lock:
+            sessions = list(self._sessions.values())
+        return [s.status() for s in sessions]
+
+    def close_all(self) -> None:
+        with self._lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        for session in sessions:
+            try:
+                session.stop()
+            except Exception:  # pragma: no cover - teardown best effort
+                pass
+
+
 def _quote(value: str) -> str:
     """Quote an argument for MI (double quotes, backslash escapes)."""
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
 
 
@@ -475,18 +615,9 @@ def _describe_location(bkpt: dict[str, Any]) -> str:
     return str(bkpt.get("fullname") or bkpt.get("at") or "")
 
 
-def _compact(record: dict[str, Any]) -> dict[str, Any]:
-    """Shrink an MI record to what a caller actually reads."""
-    out: dict[str, Any] = {"type": record.get("type", "")}
-    if record.get("message") is not None:
-        out["message"] = record["message"]
+def _error_text(record: dict[str, Any]) -> str:
+    """Pull a readable message out of an error result record."""
     payload = record.get("payload")
-    if isinstance(payload, str):
-        out["payload"] = payload.strip()
-    elif isinstance(payload, dict):
-        keep = {k: v for k, v in payload.items() if k in ("frame", "bkpt", "value", "reason", "thread-id")}
-        if keep:
-            out["payload"] = keep
-    if record.get("type") == "result" and record.get("message") == "error":
-        out["error"] = str(payload)
-    return out
+    if isinstance(payload, dict):
+        return str(payload.get("msg") or payload.get("message") or payload)
+    return str(payload or "")

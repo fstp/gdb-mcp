@@ -2,5 +2,7 @@ __pycache__/
 *.pyc
 .venv/
 build/
-demo
+# compiled test programs (sources are tracked)
 tests/demo
+tests/demo2
+tests/demo_loop
